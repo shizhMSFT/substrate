@@ -32,7 +32,8 @@ import (
 
 // PauseInput holds the immutable parameters requested by the client.
 type PauseInput struct {
-	ActorID string
+	ActorID  string
+	Atespace string
 }
 
 // PauseState holds the mutable state loaded and modified during execution.
@@ -52,7 +53,7 @@ func (s *LoadActorForPauseStep) IsComplete(ctx context.Context, input *PauseInpu
 	return false, nil
 }
 func (s *LoadActorForPauseStep) Execute(ctx context.Context, input *PauseInput, state *PauseState) error {
-	actor, err := s.store.GetActor(ctx, input.ActorID)
+	actor, err := s.store.GetActor(ctx, input.Atespace, input.ActorID)
 	if err != nil {
 		return err
 	}
@@ -114,43 +115,27 @@ func (s *CallAteletPauseStep) Execute(ctx context.Context, input *PauseInput, st
 	}
 	client := ateletpb.NewAteomHerderClient(ateletConn)
 
+	workloadSpec := workloadSpecFromActorTemplate(state.ActorTemplate)
+
 	// Checkpoint does not carry the sandbox config: atelet uses the version the
 	// actor is currently running (recorded on-node at Run/Restore) and pins it
 	// into the snapshot manifest.
 	req := &ateletpb.CheckpointRequest{
 		TargetAteomUid:         state.Actor.GetAteomPodUid(),
+		Atespace:               state.Actor.GetAtespace(),
+		ActorId:                state.Actor.GetActorId(),
 		ActorTemplateNamespace: state.Actor.GetActorTemplateNamespace(),
 		ActorTemplateName:      state.Actor.GetActorTemplateName(),
-		ActorId:                state.Actor.GetActorId(),
-		Spec: &ateletpb.WorkloadSpec{
-			PauseImage: state.ActorTemplate.Spec.PauseImage,
-		},
-		Type: ateletpb.CheckpointType_CHECKPOINT_TYPE_LOCAL,
+		Spec:                   workloadSpec,
+		Type:                   ateletpb.CheckpointType_CHECKPOINT_TYPE_LOCAL,
 		Config: &ateletpb.CheckpointRequest_LocalConfig{
 			LocalConfig: &ateletpb.LocalCheckpointConfiguration{
 				SnapshotPrefix: state.Actor.InProgressSnapshot,
 			},
 		},
+		Scope: toAteletSnapshotScope(state.ActorTemplate.Spec.SnapshotsConfig.OnPause),
 	}
-	for _, ctr := range state.ActorTemplate.Spec.Containers {
-		ateletCtr := &ateletpb.Container{
-			Name:    ctr.Name,
-			Image:   ctr.Image,
-			Command: ctr.Command,
-		}
-		for _, env := range ctr.Env {
-			var val string
-			if env.Value != nil {
-				val = *env.Value
-			}
-			ateletEnv := &ateletpb.EnvEntry{
-				Name:  env.Name,
-				Value: val,
-			}
-			ateletCtr.Env = append(ateletCtr.Env, ateletEnv)
-		}
-		req.Spec.Containers = append(req.Spec.Containers, ateletCtr)
-	}
+
 	_, err = client.Checkpoint(ctx, req)
 	if err != nil {
 		return fmt.Errorf("while checkpointing workload: %w", err)
@@ -171,7 +156,7 @@ func (s *FinalizePausedStep) IsComplete(ctx context.Context, input *PauseInput, 
 	return state.Actor.GetStatus() == ateapipb.Actor_STATUS_PAUSED && state.Actor.GetAteomPodNamespace() == "", nil
 }
 func (s *FinalizePausedStep) Execute(ctx context.Context, input *PauseInput, state *PauseState) error {
-	latestActor, err := s.store.GetActor(ctx, input.ActorID)
+	latestActor, err := s.store.GetActor(ctx, input.Atespace, input.ActorID)
 	if err != nil {
 		return err
 	}
@@ -194,20 +179,20 @@ func (s *FinalizePausedStep) Execute(ctx context.Context, input *PauseInput, sta
 			// TODO(dberkov) - what if worker does not belong to this actor?
 			nodeName = worker.GetNodeName()
 			// Only free it if it still belongs to us
-			if worker.GetActorId() == input.ActorID {
-				worker.ActorNamespace = ""
-				worker.ActorTemplate = ""
-				worker.ActorId = ""
 
-				err = s.store.UpdateWorker(ctx, worker, worker.Version)
-				if err != nil {
-					return err
+			if wass := worker.Assignment; wass != nil {
+				if wass.Actor.Name == input.ActorID {
+					worker.Assignment = nil
+					err = s.store.UpdateWorker(ctx, worker, worker.Version)
+					if err != nil {
+						return err
+					}
 				}
 			}
 		}
 
 		// 2. Safely clear ActiveWorker now that the worker object in DB is freed
-		latestActor, err = s.store.GetActor(ctx, input.ActorID)
+		latestActor, err = s.store.GetActor(ctx, input.Atespace, input.ActorID)
 		if err != nil {
 			return err
 		}

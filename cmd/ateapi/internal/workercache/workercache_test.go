@@ -31,7 +31,7 @@ import (
 )
 
 func TestCache_NotReadyBeforeStart(t *testing.T) {
-	c := workercache.New(newFakeStore())
+	c := workercache.New(newFakeStore(), time.Hour)
 	_, err := c.Workers()
 	if err == nil {
 		t.Fatal("expected error from Workers before Start, got nil")
@@ -42,7 +42,7 @@ func TestCache_SyncsOnStart(t *testing.T) {
 	w1 := makeWorker("ns", "pod1", 1)
 	w2 := makeWorker("ns", "pod2", 1)
 
-	c := workercache.New(newFakeStore(w1, w2))
+	c := workercache.New(newFakeStore(w1, w2), time.Hour)
 	ctx := t.Context()
 
 	if err := c.Start(ctx); err != nil {
@@ -60,7 +60,7 @@ func TestCache_SyncsOnStart(t *testing.T) {
 
 func TestCache_CreatedEvent(t *testing.T) {
 	fs := newFakeStore()
-	c := workercache.New(fs)
+	c := workercache.New(fs, time.Hour)
 	ctx := t.Context()
 
 	if err := c.Start(ctx); err != nil {
@@ -84,7 +84,7 @@ func TestCache_CreatedEvent(t *testing.T) {
 func TestCache_UpdatedEvent_NewerVersionApplied(t *testing.T) {
 	w := makeWorker("ns", "pod1", 1)
 	fs := newFakeStore(w)
-	c := workercache.New(fs)
+	c := workercache.New(fs, time.Hour)
 	ctx := t.Context()
 
 	if err := c.Start(ctx); err != nil {
@@ -92,12 +92,16 @@ func TestCache_UpdatedEvent_NewerVersionApplied(t *testing.T) {
 	}
 
 	updated := makeWorker("ns", "pod1", 2)
-	updated.ActorId = "actor-1"
+	updated.Assignment = &ateapipb.Assignment{Actor: &ateapipb.ActorRef{Name: "actor-1"}}
 	fs.send(store.WorkerEvent{Type: store.WorkerEventUpdated, Worker: updated})
 
 	eventually(t, func() bool {
 		workers, err := c.Workers()
-		return err == nil && len(workers) == 1 && workers[0].GetActorId() == "actor-1"
+		if err != nil || len(workers) != 1 || workers[0].Assignment == nil {
+			return false
+		}
+		wass := workers[0].Assignment
+		return wass.Actor.Name == "actor-1"
 	}, 2*time.Second)
 
 	got, _ := c.Workers()
@@ -109,7 +113,7 @@ func TestCache_UpdatedEvent_NewerVersionApplied(t *testing.T) {
 func TestCache_UpdatedEvent_OlderVersionIgnored(t *testing.T) {
 	w := makeWorker("ns", "pod1", 5)
 	fs := newFakeStore(w)
-	c := workercache.New(fs)
+	c := workercache.New(fs, time.Hour)
 	ctx := t.Context()
 
 	if err := c.Start(ctx); err != nil {
@@ -118,7 +122,7 @@ func TestCache_UpdatedEvent_OlderVersionIgnored(t *testing.T) {
 
 	// Send a stale update followed by a sentinel we can detect.
 	stale := makeWorker("ns", "pod1", 3)
-	stale.ActorId = "stale-actor"
+	stale.Assignment = &ateapipb.Assignment{Actor: &ateapipb.ActorRef{Name: "stale-actor"}}
 	fs.send(store.WorkerEvent{Type: store.WorkerEventUpdated, Worker: stale})
 
 	sentinel := makeWorker("ns", "pod2", 1)
@@ -139,7 +143,7 @@ func TestCache_UpdatedEvent_OlderVersionIgnored(t *testing.T) {
 func TestCache_DeletedEvent(t *testing.T) {
 	w := makeWorker("ns", "pod1", 1)
 	fs := newFakeStore(w)
-	c := workercache.New(fs)
+	c := workercache.New(fs, time.Hour)
 	ctx := t.Context()
 
 	if err := c.Start(ctx); err != nil {
@@ -160,7 +164,7 @@ func TestCache_DeletedEvent(t *testing.T) {
 func TestCache_Disconnect_ResyncsWithFreshSnapshot(t *testing.T) {
 	w1 := makeWorker("ns", "pod1", 1)
 	fs := newFakeStore(w1)
-	c := workercache.New(fs)
+	c := workercache.New(fs, time.Hour)
 	ctx := t.Context()
 
 	if err := c.Start(ctx); err != nil {
@@ -186,7 +190,7 @@ func TestCache_Disconnect_ResyncsWithFreshSnapshot(t *testing.T) {
 
 func TestCache_MultipleDisconnects(t *testing.T) {
 	fs := newFakeStore()
-	c := workercache.New(fs)
+	c := workercache.New(fs, time.Hour)
 	ctx := t.Context()
 
 	if err := c.Start(ctx); err != nil {
@@ -210,7 +214,7 @@ func TestCache_MultipleDisconnects(t *testing.T) {
 func TestCache_WatchClosedOnListWorkersFailure(t *testing.T) {
 	fs := newFakeStore()
 	fs.listErr = errors.New("valkey unavailable")
-	c := workercache.New(fs)
+	c := workercache.New(fs, time.Hour)
 
 	if err := c.Start(t.Context()); err == nil {
 		t.Fatal("expected Start to fail when ListWorkers errors")
@@ -226,7 +230,7 @@ func TestCache_WatchClosedOnListWorkersFailure(t *testing.T) {
 
 func TestCache_WatchClosedOnShutdown(t *testing.T) {
 	fs := newFakeStore()
-	c := workercache.New(fs)
+	c := workercache.New(fs, time.Hour)
 	ctx, cancel := context.WithCancel(t.Context())
 
 	if err := c.Start(ctx); err != nil {
@@ -244,7 +248,7 @@ func TestCache_WatchClosedOnShutdown(t *testing.T) {
 
 func TestCache_WatchClosedOnDisconnectAndShutdown(t *testing.T) {
 	fs := newFakeStore()
-	c := workercache.New(fs)
+	c := workercache.New(fs, time.Hour)
 	ctx, cancel := context.WithCancel(t.Context())
 
 	if err := c.Start(ctx); err != nil {
@@ -266,6 +270,87 @@ func TestCache_WatchClosedOnDisconnectAndShutdown(t *testing.T) {
 		defer fs.mu.Unlock()
 		return fs.closes == 2
 	}, 2*time.Second)
+}
+
+func TestCache_Relist_RecoversFromMissedCreate(t *testing.T) {
+	w1 := makeWorker("ns", "pod1", 1)
+	fs := newFakeStore(w1)
+	c := workercache.New(fs, 10*time.Millisecond)
+
+	if err := c.Start(t.Context()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// Add a worker directly to the store without sending a watch event,
+	// simulating a silent PUBLISH failure.
+	w2 := makeWorker("ns", "pod2", 1)
+	fs.setWorkers(w1, w2)
+
+	eventually(t, func() bool {
+		workers, err := c.Workers()
+		return err == nil && len(workers) == 2
+	}, 2*time.Second)
+
+	got, _ := c.Workers()
+	if diff := cmp.Diff([]*ateapipb.Worker{w1, w2}, got, protocmp.Transform(), workerSortOpt); diff != "" {
+		t.Errorf("workers after relist (-want +got):\n%s", diff)
+	}
+}
+
+func TestCache_Relist_RecoversFromMissedDelete(t *testing.T) {
+	w1 := makeWorker("ns", "pod1", 1)
+	w2 := makeWorker("ns", "pod2", 1)
+	fs := newFakeStore(w1, w2)
+	c := workercache.New(fs, 10*time.Millisecond)
+
+	if err := c.Start(t.Context()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// Remove a worker from the store without a watch event,
+	// simulating a silent PUBLISH failure on delete.
+	fs.setWorkers(w1)
+
+	eventually(t, func() bool {
+		workers, err := c.Workers()
+		return err == nil && len(workers) == 1
+	}, 2*time.Second)
+
+	got, _ := c.Workers()
+	if diff := cmp.Diff([]*ateapipb.Worker{w1}, got, protocmp.Transform(), workerSortOpt); diff != "" {
+		t.Errorf("workers after relist (-want +got):\n%s", diff)
+	}
+}
+
+func TestCache_Relist_FailureIsNonFatal(t *testing.T) {
+	w1 := makeWorker("ns", "pod1", 1)
+	fs := newFakeStore(w1)
+	c := workercache.New(fs, 10*time.Millisecond)
+
+	if err := c.Start(t.Context()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// Make ListWorkers fail to simulate a transient Valkey error.
+	fs.mu.Lock()
+	fs.listErr = errors.New("valkey unavailable")
+	fs.mu.Unlock()
+
+	// Wait long enough for at least one relist attempt.
+	time.Sleep(50 * time.Millisecond)
+
+	// Clear the error; the cache should still be usable with the old snapshot.
+	fs.mu.Lock()
+	fs.listErr = nil
+	fs.mu.Unlock()
+
+	workers, err := c.Workers()
+	if err != nil {
+		t.Fatalf("Workers: %v", err)
+	}
+	if diff := cmp.Diff([]*ateapipb.Worker{w1}, workers, protocmp.Transform(), workerSortOpt); diff != "" {
+		t.Errorf("workers mismatch (-want +got):\n%s", diff)
+	}
 }
 
 type fakeStore struct {

@@ -59,31 +59,31 @@ func newRequestMetadata(headers []*corev3.HeaderValue) *requestMetadata {
 	}
 }
 
-func (m *requestMetadata) actorID() (string, error) {
+// actorRef resolves the (atespace, actor id) a request is addressed to. When
+// the x-substrate-actor-id header is present it takes precedence over the Host
+// header, which supports public routing (e.g. AKS) where the ingress hostname
+// does not encode the actor ref. In that case the atespace is left empty.
+func (m *requestMetadata) actorRef() (atespace, actorID string, err error) {
 	if actorID := strings.TrimSpace(m.headers[actorIDHeader]); actorID != "" {
 		if err := resources.ValidateActorID(actorID); err != nil {
-			return "", fmt.Errorf("invalid %s: %w", actorIDHeader, err)
+			return "", "", fmt.Errorf("invalid %s: %w", actorIDHeader, err)
 		}
-		return actorID, nil
+		return "", actorID, nil
 	}
-	return parseActorID(m.host)
+	return parseActorRef(m.host)
 }
 
-func parseActorID(host string) (string, error) {
-	var err error
+// parseActorRef extracts the (atespace, actor id) an incoming request is
+// addressed to from its Host/:authority, which has the form
+// "<actor_id>.<atespace>.actors.resources.substrate.ate.dev" (optionally with a
+// port). The atespace is required because an actor id is only unique within its
+// atespace.
+func parseActorRef(host string) (atespace, actorID string, err error) {
 	if strings.Contains(host, ":") {
 		host, _, err = net.SplitHostPort(host)
+		if err != nil {
+			return "", "", err
+		}
 	}
-	if err != nil {
-		return "", err
-	}
-	actorID, found := strings.CutSuffix(strings.TrimSuffix(host, "."), "."+resources.ActorDNSSuffix)
-	if !found {
-		return "", fmt.Errorf("invalid actor_id: must end with %s, got %q", resources.ActorDNSSuffix, host)
-	}
-	if err := resources.ValidateActorID(actorID); err != nil {
-		return "", err
-	}
-
-	return actorID, nil
+	return resources.ParseActorDNSName(host)
 }

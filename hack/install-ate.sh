@@ -63,6 +63,7 @@ function usage() {
   echo "  --deploy-ate-system                    Deploy core system (CRDs, atelet, apiserver)"
   echo "  --delete-ate-system                    Delete core system"
   echo "  --delete-all                           Delete core system and all registered demos"
+  echo "  --auth-mode=mtls|jwt                   Select ateapi auth mode for --deploy-ate-system (default: mtls)"
   echo ""
   echo "Infrastructure components:"
   echo ""
@@ -80,6 +81,12 @@ function usage() {
   echo "  --create-workerpool-ca-certs-secret    Create workerpool CA certs secret for AKS dev installs"
   echo "  --create-servicedns-credential-secret  Create service DNS credential bundle Secret for AKS dev installs"
   echo "  --create-api-server-env-vars           Create ate-api-server env vars"
+  echo ""
+  echo "Benchmarks (see benchmarking/README.md for details and customization):"
+  echo ""
+  echo "  --deploy-benchmarks                    Deploy workloads + locust load test stack"
+  echo "  --delete-benchmarks                    Delete the locust stack and workloads"
+  echo "  --benchmark-worker-count N             Number of WorkerPool replicas (default: 1)"
   echo ""
   for demo_name in "${ATE_DEMOS[@]}"; do
     echo "Demo: ${demo_name}"
@@ -189,6 +196,41 @@ render_atelet_kustomize() {
       return 1
       ;;
   esac
+}
+
+ate_auth_mode() {
+  case "${ATE_API_AUTH_MODE:-mtls}" in
+    mtls|jwt)
+      echo "${ATE_API_AUTH_MODE:-mtls}"
+      ;;
+    *)
+      echo "Error: ATE_API_AUTH_MODE must be mtls or jwt, got '${ATE_API_AUTH_MODE}'" >&2
+      exit 1
+      ;;
+  esac
+}
+
+render_ate_system_manifests() {
+  local platform auth_mode
+  platform="$(install_platform)"
+  auth_mode="$(ate_auth_mode)"
+
+  if [[ "${auth_mode}" == "jwt" ]]; then
+    local overlay="manifests/ate-install/jwt"
+    if [[ "${ATE_INSTALL_KIND:-false}" == "true" ]]; then
+      overlay="manifests/ate-install/kind-jwt"
+    fi
+    kubectl kustomize "${overlay}" --load-restrictor LoadRestrictionsNone | run_ko resolve -f -
+    return
+  fi
+
+  if [[ "${platform}" == "base" ]]; then
+    # Build everything resolved with base manifests for GKE
+    run_ko resolve -f manifests/ate-install
+  else
+    # Build everything resolved with the selected platform Kustomize overlay (kind/aks).
+    render_install_kustomize | run_ko resolve -f -
+  fi
 }
 
 create_valkey_ca_certs_secret() {
@@ -400,13 +442,7 @@ deploy_ate_system() {
   fi
 
   local manifests=""
-  if [[ "$(install_platform)" == "base" ]]; then
-    # Build everything resolved with base manifests for GKE
-    manifests=$(run_ko resolve -f manifests/ate-install)
-  else
-    # Build everything resolved with the selected platform Kustomize overlay.
-    manifests=$(render_install_kustomize | run_ko resolve -f -)
-  fi
+  manifests="$(render_ate_system_manifests)"
   if [[ "$(install_platform)" == "aks" ]]; then
     # The Valkey init Job embeds its pod template, which is immutable. AKS dev
     # overlays patch its volumes, so recreate the Job before applying.
@@ -495,9 +531,10 @@ deploy_atenet() {
 # get_actor_status echoes the actor's status enum (e.g. STATUS_SUSPENDED).
 get_actor_status() {
   local actor_id="$1"
+  local atespace="$2"
   local json
 
-  if ! json=$(run_kubectl_ate get actor "${actor_id}" -o json 2>/dev/null); then
+  if ! json=$(run_kubectl_ate get actor "${actor_id}" -a "${atespace}" -o json 2>/dev/null); then
     return 1
   fi
   jq -r '.actors[0].status // empty' <<<"${json}"
@@ -507,12 +544,13 @@ get_actor_status() {
 # is allowed. Actors must be STATUS_SUSPENDED before deletion.
 prepare_actor_for_delete() {
   local actor_id="$1"
-  local timeout_secs="${2:-120}"
+  local atespace="$2"
+  local timeout_secs="${3:-120}"
   local deadline=$((SECONDS + timeout_secs))
   local status
 
   while ((SECONDS < deadline)); do
-    if ! status=$(get_actor_status "${actor_id}"); then
+    if ! status=$(get_actor_status "${actor_id}" "${atespace}"); then
       return 0
     fi
 
@@ -521,10 +559,10 @@ prepare_actor_for_delete() {
         return 0
         ;;
       STATUS_PAUSED)
-        run_kubectl_ate resume actor "${actor_id}" -o json >/dev/null
+        run_kubectl_ate resume actor "${actor_id}" -a "${atespace}" -o json >/dev/null
         ;;
       STATUS_RUNNING)
-        run_kubectl_ate suspend actor "${actor_id}" -o json >/dev/null
+        run_kubectl_ate suspend actor "${actor_id}" -a "${atespace}" -o json >/dev/null
         ;;
       STATUS_RESUMING | STATUS_SUSPENDING | STATUS_PAUSING)
         ;;
@@ -562,26 +600,26 @@ delete_demo_actors() {
   fi
 
   local actors_json
-  if ! actors_json=$(run_kubectl_ate get actors -o json 2>/dev/null); then
+  if ! actors_json=$(run_kubectl_ate get actors -A -o json 2>/dev/null); then
     echo "warning: could not list actors; skipping actor cleanup" >&2
     return 0
   fi
 
-  local ns tmpl actor_id
+  local ns tmpl atespace actor_id
   while (($# > 0)); do
     ns="$1"
     tmpl="$2"
     shift 2
 
     log_step "Deleting actors for ${ns}/${tmpl}"
-    while IFS= read -r actor_id; do
+    while IFS=$'\t' read -r atespace actor_id; do
       [[ -z "${actor_id}" ]] && continue
-      log_step "  preparing actor ${actor_id} for delete"
-      prepare_actor_for_delete "${actor_id}"
-      run_kubectl_ate delete actor "${actor_id}"
+      log_step "  preparing actor ${atespace}/${actor_id} for delete"
+      prepare_actor_for_delete "${actor_id}" "${atespace}"
+      run_kubectl_ate delete actor "${actor_id}" -a "${atespace}"
     done < <(
       jq -r --arg ns "${ns}" --arg tmpl "${tmpl}" \
-        '.actors[]? | select(.actorTemplateNamespace == $ns and .actorTemplateName == $tmpl) | .actorId' \
+        '.actors[]? | select(.actorTemplateNamespace == $ns and .actorTemplateName == $tmpl) | "\(.atespace)\t\(.actorId)"' \
         <<<"${actors_json}"
     )
   done
@@ -601,6 +639,16 @@ delete_ate_system() {
 delete_atenet() {
   log_step "delete_atenet"
   run_kubectl delete --ignore-not-found -f manifests/ate-install/atenet-router.yaml
+}
+
+deploy_benchmarks() {
+  log_step "deploy_benchmarks (worker_count=${BENCHMARK_WORKER_COUNT})"
+  "${ROOT}/benchmarking/deploy_locust.sh" --deploy --worker-count "${BENCHMARK_WORKER_COUNT}"
+}
+
+delete_benchmarks() {
+  log_step "delete_benchmarks"
+  "${ROOT}/benchmarking/deploy_locust.sh" --delete
 }
 
 delete_all() {
@@ -628,6 +676,31 @@ for arg in "$@"; do
   esac
 done
 
+# Pre-scan value-bearing flags so they can appear before or after the action
+# flag they configure (e.g. --benchmark-worker-count before/after
+# --deploy-benchmarks). The dispatch loop below also accepts these flags but
+# treats them as no-ops since the value is already captured here.
+BENCHMARK_WORKER_COUNT=1
+prescan_args=("$@")
+for ((i = 0; i < ${#prescan_args[@]}; i++)); do
+  case "${prescan_args[i]}" in
+    --auth-mode=*) ATE_API_AUTH_MODE="${prescan_args[i]#*=}" ;;
+    --auth-mode)
+      if (( i + 1 >= ${#prescan_args[@]} )); then
+        echo "Error: --auth-mode requires mtls or jwt" >&2
+        exit 1
+      fi
+      ATE_API_AUTH_MODE="${prescan_args[$((i + 1))]}"
+      ;;
+    --benchmark-worker-count)
+      BENCHMARK_WORKER_COUNT="${prescan_args[i+1]:-1}"
+      ;;
+    --benchmark-worker-count=*)
+      BENCHMARK_WORKER_COUNT="${prescan_args[i]#*=}"
+      ;;
+  esac
+done
+
 while [[ "$#" -gt 0 ]]; do
   # Run ${demo}_cmdline if it exists. If it returns 0, then we successfully
   # handled this argument and can continue. Otherwise, fallthrough to check
@@ -642,6 +715,16 @@ while [[ "$#" -gt 0 ]]; do
   done
 
   case $1 in
+    --auth-mode=*) ATE_API_AUTH_MODE="${1#*=}" ;;
+    --auth-mode)
+      shift
+      if [[ "$#" -eq 0 ]]; then
+        echo "Error: --auth-mode requires mtls or jwt" >&2
+        exit 1
+      fi
+      ATE_API_AUTH_MODE="$1"
+      ;;
+
     --deploy-ate-system) deploy_ate_system ;;
     --delete-ate-system) delete_ate_system ;;
     --delete-all) delete_all ;;
@@ -651,6 +734,13 @@ while [[ "$#" -gt 0 ]]; do
 
     --deploy-atenet) deploy_atenet ;;
     --delete-atenet) delete_atenet ;;
+
+    --deploy-benchmarks) deploy_benchmarks ;;
+    --delete-benchmarks) delete_benchmarks ;;
+    # Value captured in the pre-scan above; consume the value arg here so the
+    # dispatch loop's `*)` unknown-option branch doesn't reject it.
+    --benchmark-worker-count) shift ;;
+    --benchmark-worker-count=*) ;;
 
     --create-jwt-authority-pool-secret) create_jwt_authority_pool_secret ;;
     --create-session-id-ca-pool-secret) create_session_id_ca_pool_secret ;;

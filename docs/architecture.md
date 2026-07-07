@@ -336,15 +336,15 @@ The node-level subsystem manages the physical execution of sandboxes and the mov
 
 A `WorkerPool` selects a **sandbox class** (`spec.sandboxClass`), and each class has a matching `ateom` herder image. The sandbox binaries themselves are not baked into the worker image — they are fetched at runtime from a cluster-scoped [`SandboxConfig`](api-guide.md#3-sandboxconfig-sandbox-binaries) and pinned into each snapshot's manifest so restores stay reproducible across runtime upgrades.
 
-  * **gVisor** (`ateom-gvisor`, the default): runs the workload under `runsc`. Suspend/resume uses gVisor's checkpoint/restore of the sandboxed process tree.
+  * **gVisor** (`ateom-gvisor`, the default): Runs the workload under `runsc` for kernel-level sandboxing. Suspend and resume leverage gVisor's native checkpoint/restore of the sandboxed process tree.
 
-  * **micro-VM** (`ateom-microvm`): runs the workload inside a [Kata Containers](https://katacontainers.io/) guest (Kata 3.31 guest assets) on the [Cloud Hypervisor](https://www.cloudhypervisor.org/) VMM. `ateom` owns the Cloud Hypervisor boot directly — there is **no Kata shim and no containerd daemon**: it launches Cloud Hypervisor, boots the guest kernel + OS image, and then drives the Kata agent over its hybrid-vsock ttrpc API itself (creating the sandbox, configuring guest networking, and starting the container). The actor's container rootfs is a writable boot-time virtio-blk disk (`/dev/vdb`) that `ateom` builds with `mkfs.ext4` from the OCI bundle, so rootfs writes land off guest RAM on a host-backed disk. Suspend captures a Cloud Hypervisor **memory-only snapshot** of the running guest (no memory balloon); resume relaunches Cloud Hypervisor with its **OnDemand** (userfaultfd) memory restore — demand-paging from the snapshot while a diff-merge folds newly-faulted pages back in to keep the snapshot complete — so full in-RAM state comes back on any worker, including a different node. On each restore `/dev/vdb` is recreated byte-identical to the golden image (**reset-to-golden**), so rootfs writes are discarded across suspend/resume (matching gVisor's semantics) while in-RAM state persists. The actor container's stdout/stderr is forwarded to the pod log with `ate.dev/*` labels (parity with `ateom-gvisor`). Micro-VM workers require `/dev/kvm` and nested-virtualization-capable nodes; the controller adds the KVM device mount and pins these pods to nodes labeled `ate.dev/sandboxClass=microvm`. See [`hack/microvm-assets/`](../hack/microvm-assets/) for assembling the asset set.
+  * **micro-VM** (`ateom-microvm`): Runs the workload inside a [Kata Containers](https://katacontainers.io/) guest on the [Cloud Hypervisor](https://www.cloudhypervisor.org/) VMM. Suspend and resume capture a memory-only VM snapshot and restore it on-demand using `userfaultfd` memory demand-paging, with container rootfs writes captured in guest RAM via a `tmpfs` overlay.
 
 ### Networking Stack (`atenet` + Envoy)
 
 Handles session-aware routing and automatic re-animation.
 
-  * **Uniform DNS Mesh**: Substrate provides a location-transparent actor discovery scheme via a global DNS suffix (`<id>.actors.resources.substrate.ate.dev`).
+  * **Uniform DNS Mesh**: Substrate provides a location-transparent actor discovery scheme via a global DNS suffix (`<id>.<atespace>.actors.resources.substrate.ate.dev`).
 
   * **Routing**: The `atenet` router (powered by Envoy and an External Processing server) intercepts traffic destined for the mesh. It extracts the actor ID from the `Host` header, queries the Control Plane to determine the actor's current location, and triggers a `ResumeActor` workflow if the session is currently suspended.
 
@@ -478,7 +478,7 @@ Agent Substrate is built on a **Defense-in-Depth** model:
 
   * **Request Authorization**: The system currently performs **Identity-Aware
     Routing** by utilizing a uniform DNS routing scheme
-    (`<actor id>.actors.resources.substrate.ate.dev`)
+    (`<actor id>.<atespace>.actors.resources.substrate.ate.dev`)
     at the gateway to extract and validate actor identifiers from incoming traffic. This
     ensures requests are only routed to recognized, registered actors.
     Pluggable, granular authorization policies are planned for future

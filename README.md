@@ -114,8 +114,9 @@ hack/install-ate-kind.sh --deploy-demo-counter
 # install kubectl-ate
 go install ./cmd/kubectl-ate
 
-# create a counter actor and demo it
-kubectl ate create actor my-counter-1 --template ate-demo-counter/counter
+# create an atespace (required before creating actors), then a counter actor in it
+kubectl ate create atespace demo
+kubectl ate create actor my-counter-1 -a demo --template ate-demo-counter/counter
 
 # port-forward the network router to bind to local port `8000`
 kubectl port-forward -n ate-system svc/atenet-router 8000:80
@@ -123,7 +124,7 @@ kubectl port-forward -n ate-system svc/atenet-router 8000:80
 
 3. In a **separate terminal**, send an HTTP request to increment the counter:
 ```shell
-curl -X POST -H "Host: my-counter-1.actors.resources.substrate.ate.dev" -i http://localhost:8000/
+curl -X POST -H "Host: my-counter-1.demo.actors.resources.substrate.ate.dev" -i http://localhost:8000/
 ```
 
 ### GKE Quickstart (Development)
@@ -143,7 +144,7 @@ curl -X POST -H "Host: my-counter-1.actors.resources.substrate.ate.dev" -i http:
 
 3. Provision the required GCP resources (GKE cluster, Redis, GCS, and IAM bindings):
    ```bash
-   go run ./tools/setup-gcp --all
+   go run ./tools/setup-gcp bootstrap
    ```
 
 4. Deploy the Agent Substrate system to your cluster (remember to navigate back to root directory of this repo before running the following commands):
@@ -160,8 +161,8 @@ curl -X POST -H "Host: my-counter-1.actors.resources.substrate.ate.dev" -i http:
 
 You can run individual setup steps to create GCP resources as needed. See `go run ./tools/setup-gcp --help` for available options. For example:
 ```bash
-go run ./tools/setup-gcp --create-cluster
-go run ./tools/setup-gcp --create-gvisor-node-pool
+go run ./tools/setup-gcp create cluster
+go run ./tools/setup-gcp create bucket
 ```
 
 Similarly, you can deploy or cleanup specific Agent Substrate components using the installation script. See `./hack/install-ate.sh --help` for all options.
@@ -286,6 +287,7 @@ We provide several sample applications demonstrating Agent Substrate's capabilit
 * [Full CLI Documentation](cmd/kubectl-ate/README.md): Installation and usage for `kubectl-ate`.
 * [Glossary](docs/glossary.md): Core terms (Actor, ActorTemplate, WorkerPool, Worker, ate-api-server, atenet, atelet, ateom) and how they relate.
 * [Observability Guide](docs/observability.md): Guide to actor logging, metrics, and distributed tracing.
+* [Benchmarking Guide](benchmarking/README.md): Locust-based load tests, monitoring stack, and the orchestrated benchmark harness.
 
 ## Tour
 

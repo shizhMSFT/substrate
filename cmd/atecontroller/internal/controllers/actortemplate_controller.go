@@ -19,9 +19,12 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/agent-substrate/substrate/internal/resources"
 	atev1alpha1 "github.com/agent-substrate/substrate/pkg/api/v1alpha1"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"github.com/google/uuid"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	k8errors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -32,6 +35,14 @@ import (
 
 const (
 	GoldenSnapshotCreationReason = "GoldenSnapshotCreation"
+
+	// goldenSnapshotWarmup is the default wall-clock delay between resuming
+	// the golden actor and taking its snapshot, used as a coarse "give the
+	// workload time to finish initializing" fallback for templates without
+	// a readiness probe. Templates whose containers all declare readyz skip
+	// this wait — ResumeActor only returns once readyz reports 200, so the
+	// workload is already initialized by the time we get here.
+	goldenSnapshotWarmup = 20 * time.Second
 )
 
 type ActorTemplateReconciler struct {
@@ -71,12 +82,18 @@ func (r *ActorTemplateReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	case atev1alpha1.PhaseInitial:
 		actorID := uuid.NewString()
 
+		// Golden actors live in the reserved ate-golden system atespace.
+		_, err := r.AteClient.CreateAtespace(ctx, &ateapipb.CreateAtespaceRequest{Name: resources.GoldenActorAtespace})
+		if err != nil && status.Code(err) != codes.AlreadyExists {
+			return ctrl.Result{}, fmt.Errorf("while ensuring atespace %q: %w", resources.GoldenActorAtespace, err)
+		}
+
 		createReq := &ateapipb.CreateActorRequest{
-			ActorId:                actorID,
+			ActorRef:               &ateapipb.ActorRef{Atespace: resources.GoldenActorAtespace, Name: actorID},
 			ActorTemplateNamespace: at.ObjectMeta.Namespace,
 			ActorTemplateName:      at.ObjectMeta.Name,
 		}
-		_, err := r.AteClient.CreateActor(ctx, createReq)
+		_, err = r.AteClient.CreateActor(ctx, createReq)
 		if err != nil {
 			return ctrl.Result{}, fmt.Errorf("while creating golden actor: %w", err)
 		}
@@ -101,7 +118,7 @@ func (r *ActorTemplateReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		// TODO: Maybe this should go through a different RPC dedicated to
 		// booting an actor from scratch.
 		resumeReq := &ateapipb.ResumeActorRequest{
-			ActorId: at.Status.GoldenActorID,
+			ActorRef: &ateapipb.ActorRef{Atespace: resources.GoldenActorAtespace, Name: at.Status.GoldenActorID},
 		}
 		_, err := r.AteClient.ResumeActor(ctx, resumeReq)
 		if err != nil {
@@ -109,7 +126,7 @@ func (r *ActorTemplateReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 
 		at.Status.Phase = atev1alpha1.PhaseWaitGoldenActor
-		at.Status.TakeGoldenSnapshotAt = metav1.NewTime(time.Now().Add(20 * time.Second))
+		at.Status.TakeGoldenSnapshotAt = metav1.NewTime(time.Now().Add(goldenSnapshotWarmupFor(at)))
 		if err := r.Status().Update(ctx, at); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -127,7 +144,7 @@ func (r *ActorTemplateReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		// from it.
 
 		req := &ateapipb.SuspendActorRequest{
-			ActorId: at.Status.GoldenActorID,
+			ActorRef: &ateapipb.ActorRef{Atespace: resources.GoldenActorAtespace, Name: at.Status.GoldenActorID},
 		}
 		resp, err := r.AteClient.SuspendActor(ctx, req)
 		if err != nil {
@@ -162,4 +179,21 @@ func (r *ActorTemplateReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 // SetupWithManager sets up the controller with the Manager.
 func (r *ActorTemplateReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).For(&atev1alpha1.ActorTemplate{}).Complete(r)
+}
+
+// goldenSnapshotWarmupFor returns 0 when every container in the template has
+// a readyz probe (so ResumeActor already blocked until the workload reported
+// 200), and the default warmup otherwise. A template with no containers
+// keeps the default — there is nothing to gate on.
+func goldenSnapshotWarmupFor(at *atev1alpha1.ActorTemplate) time.Duration {
+	containers := at.Spec.Containers
+	if len(containers) == 0 {
+		return goldenSnapshotWarmup
+	}
+	for i := range containers {
+		if containers[i].Readyz == nil {
+			return goldenSnapshotWarmup
+		}
+	}
+	return 0
 }

@@ -35,18 +35,18 @@ service AteomHerder {
 message RunRequest {
   string target_ateom_uid = 1;
 
-  string actor_template_namespace = 3;
-  string actor_template_name      = 4;
-  string actor_id                 = 5;
+  string atespace = 2;
+  string actor_id = 3;
 
-  reserved 8; // was RunscConfig runsc
+  string actor_template_namespace = 4;
+  string actor_template_name      = 5;
 
-  WorkloadSpec spec = 7;
+  WorkloadSpec spec = 6;
 
   // The sandbox binaries to use for booting this actor from scratch. atelet
   // fetches the relevant assets and records them with the actor's on-node state
   // so a later Checkpoint can pin the same version into the snapshot manifest.
-  SandboxAssets sandbox_assets = 9;
+  SandboxAssets sandbox_assets = 7;
 }
 
 // AssetFile is one content-addressed file atelet fetches for a sandbox runtime
@@ -77,18 +77,58 @@ message SandboxAssets {
 message WorkloadSpec {
   repeated Container containers  = 1;
   string             pause_image = 2;
+  repeated Volume    volumes     = 3;
+}
+
+enum VolumeType {
+  VOLUME_TYPE_UNSPECIFIED  = 0;
+  VOLUME_TYPE_DURABLE_DIR  = 1;
+}
+
+message DurableDirVolume {
+}
+
+message Volume {
+  string name = 1;
+
+  VolumeType type = 2;
+
+  oneof source{
+    DurableDirVolume durable_dir = 3;
+  }
+}
+
+message VolumeMount{
+  string name = 1;
+  string mount_path = 2;
 }
 
 message Container {
-  string            name    = 1;
-  string            image   = 2;
-  repeated string   command = 3;
-  repeated EnvEntry env     = 4;
+  string               name          = 1;
+  string               image         = 2;
+  repeated string      command       = 3;
+  repeated EnvEntry    env           = 4;
+  Readyz               readyz  = 5;
+  repeated VolumeMount volume_mounts = 6;
 }
 
 message EnvEntry {
   string name  = 1;
   string value = 2;
+}
+
+// Readyz describes how to check that a container is ready to serve.
+// Only HTTP is supported today.
+message Readyz {
+  HTTPGetAction http_get = 1;
+}
+
+// HTTPGetAction performs an HTTP GET against the container.
+message HTTPGetAction {
+  // Path to access on the HTTP server. Empty means "/readyz".
+  string path = 1;
+  // TCP port to connect to (1..65535).
+  int32  port = 2;
 }
 
 message RunResponse {
@@ -123,30 +163,42 @@ enum CheckpointType {
   CHECKPOINT_TYPE_EXTERNAL = 2;
 }
 
+enum SnapshotScope {
+  // Not valid option; should never happen.
+  SNAPSHOT_SCOPE_UNSPECIFIED = 0;
+  // Capture process memory plus the full filesystem delta on top of the OCI
+  // image (including any attached DurableDir volumes).
+  SNAPSHOT_SCOPE_FULL = 1;
+  // Capture only the contents of attached volumes that support snapshots
+  // (currently DurableDir-typed volumes). Memory and the rest of rootfs are
+  // excluded.
+  SNAPSHOT_SCOPE_DATA = 2;
+}
+
 message CheckpointRequest {
   string target_ateom_uid = 1;
 
-  string actor_template_namespace = 3;
-  string actor_template_name      = 4;
-  string actor_id                 = 5;
+  string atespace = 2;
+  string actor_id = 3;
+
+  string actor_template_namespace = 4;
+  string actor_template_name      = 5;
 
   // Sandbox binary config is not sent on checkpoint: atelet uses the version the
   // actor is currently running (recorded with the actor's on-node state at
   // Run/Restore) and records it into the snapshot manifest.
-  reserved 6; // was RunscConfig runsc
+  WorkloadSpec spec = 6;
 
-  WorkloadSpec spec = 7;
-
-  // deprecated snapshot_uri_prefix
-  reserved 8;
-
-  CheckpointType type = 9;
+  CheckpointType type = 7;
 
   // The checkpoint configuration, depending on the type.
   oneof config {
-    LocalCheckpointConfiguration local_config    = 10;
-    ExternalCheckpointConfiguration external_config = 11;
+    LocalCheckpointConfiguration local_config    = 8;
+    ExternalCheckpointConfiguration external_config = 9;
   }
+
+  // What should be included in the checkpoint.
+  SnapshotScope scope = 10;
 }
 
 message CheckpointResponse {
@@ -156,27 +208,27 @@ message CheckpointResponse {
 message RestoreRequest {
   string target_ateom_uid = 1;
 
-  string actor_template_namespace = 3;
-  string actor_template_name      = 4;
-  string actor_id                 = 5;
+  string atespace = 2;
+  string actor_id = 3;
+
+  string actor_template_namespace = 4;
+  string actor_template_name      = 5;
 
   // Sandbox binary config is not sent on restore: the snapshot is
   // self-describing. atelet reads the snapshot manifest to recover the pinned
   // sandbox version that created it.
-  reserved 6; // was RunscConfig runsc
+  WorkloadSpec spec = 6;
 
-  WorkloadSpec spec = 7;
-
-  // deprecated snapshot_uri_prefix
-  reserved 8;
-
-  CheckpointType type = 9;
+  CheckpointType type = 7;
 
   // The checkpoint configuration, depending on the type.
   oneof config {
-    LocalCheckpointConfiguration local_config    = 10;
-    ExternalCheckpointConfiguration external_config = 11;
+    LocalCheckpointConfiguration local_config    = 8;
+    ExternalCheckpointConfiguration external_config = 9;
   }
+
+  // What content to restore from the checkpoint.
+  SnapshotScope scope = 10;
 }
 
 message RestoreResponse {
