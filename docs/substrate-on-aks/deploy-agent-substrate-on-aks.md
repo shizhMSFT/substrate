@@ -1,6 +1,6 @@
 # Deploy Agent Substrate on AKS
 
-> Date: 2026-06-10
+> Date: 2026-07-07 (milestone reached 2026-06-10)
 
 ## Outcome
 
@@ -14,7 +14,7 @@ The Agent Substrate AKS deployment path reached a successful smoke test, based o
 - **AKS overlay:** added `manifests/ate-install/aks` and selected it with `ATE_INSTALL_AKS=true`, mirroring the existing incremental `ATE_INSTALL_KIND=true` pattern rather than introducing a broader platform abstraction.
 - **Azure Workload Identity:** wired the atelet Kubernetes service account with Azure Workload Identity annotations/labels and configured the setup tool to print `AZURE_ATELET_CLIENT_ID`.
 - **ACR image pulls inside atelet:** added `--azure-auth-for-image-pulls=true` so atelet's internal image pull cache can authenticate to Azure Container Registry with managed identity credentials.
-- **Demo snapshot location:** changed the counter demo path to use `SNAPSHOT_LOCATION`, allowing Azure runs to use `azblob://...` without pretending Azure containers are GCS buckets.
+- **Demo snapshot location:** the demo templates use an `ATE_STORAGE_ROOT` placeholder (substituted by the `hack/install-demo-*.sh` scripts), so Azure runs can set `ATE_STORAGE_ROOT=azblob://...` without pretending Azure containers are GCS buckets. (`ATE_STORAGE_ROOT` superseded the earlier `SNAPSHOT_LOCATION` variable.)
 
 ## Live issues found and fixes
 
