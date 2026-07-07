@@ -11,11 +11,17 @@ Your intuition is correct. As a consumer of Substrate, the interaction is:
 ```
 1. Install Substrate on a K8s cluster
 2. Define workload infrastructure (CRDs: WorkerPool + ActorTemplate)
-3. Create actor instances (via CLI or gRPC API)
+3. Create an atespace, then actor instances in it (via CLI or gRPC API)
 4. Send HTTP traffic → auto-activates suspended actors
 ```
 
-Plus optional lifecycle management (suspend, delete, observe).
+Plus optional lifecycle management (suspend, resume, pause, delete, observe).
+
+> **Atespace:** actors live inside an **atespace** — the isolation boundary an
+> actor belongs to. An actor is identified by the pair `(atespace, actor-id)`;
+> an actor id is only unique within its atespace. The atespace must exist before
+> you can create actors in it, and it becomes part of the actor's routing DNS
+> name and its storage key (`actor:<atespace>:<actor-id>`).
 
 ---
 
@@ -62,12 +68,15 @@ kind: WorkerPool
 metadata:
   name: my-pool
   namespace: my-app
+  labels:
+    workload: my-agent        # ActorTemplates select pools by these labels
 spec:
   replicas: 5                  # Number of warm, standby pods
   ateomImage: ko://github.com/agent-substrate/substrate/cmd/ateom-gvisor
+  # sandboxClass: gvisor       # optional; gvisor (default) or microvm
 ```
 
-**What happens:** The controller creates a Deployment with `replicas` pods. Each pod runs `ateom-gvisor` (privileged) and sits idle, waiting to host actors.
+**What happens:** The controller creates a Deployment with `replicas` pods. Each pod runs `ateom-gvisor` (privileged) and sits idle, waiting to host actors. Pools are selected by `ActorTemplate.spec.workerSelector` matching the pool's **labels** (there is no direct pool reference on the template).
 
 ### 2b. ActorTemplate — Workload Blueprint
 
@@ -78,15 +87,6 @@ metadata:
   name: my-agent
   namespace: my-app
 spec:
-  # gVisor binary to use (pinned by SHA256)
-  runsc:
-    amd64:
-      url: "gs://gvisor/releases/nightly/2026-05-19/x86_64/runsc"
-      sha256Hash: "a397be1abc2420d26bce6c70e6e2ff96c73aaaab929756c56f5e2089ea842b63"
-    arm64:
-      url: "gs://gvisor/releases/nightly/2026-05-19/aarch64/runsc"
-      sha256Hash: "1ba2366ae2efceba166046f51a4104f9261c9cb72c6db8f5b3fe2dc57dea86b9"
-
   # Root sandbox container (must be pinned @sha256)
   pauseImage: "registry.k8s.io/pause:3.10.2@sha256:f548e0e8e3dc..."
 
@@ -95,21 +95,41 @@ spec:
   - name: agent
     image: gcr.io/my-project/my-agent@sha256:abc123...  # MUST be pinned
     command: ["/app/server"]
-    ports:
-    - containerPort: 80
-    env:
-    - name: PORT
-      value: "80"
+    readyz:                    # readiness probe against the container's interior IP
+      httpGet:
+        path: /readyz
+        port: 80
+    volumeMounts:              # optional; mount durable volumes
+    - name: data
+      mountPath: /home/agent
 
-  # Which worker pool provides compute
-  workerPoolRef:
-    name: my-pool
-    namespace: my-app
+  # sandboxClass: gvisor       # optional; gvisor (default) or microvm.
+                               # Must match the eligible WorkerPools' class.
 
-  # Where to store memory + disk snapshots
+  # Which worker pools may host this template's actors (by pool label).
+  workerSelector:
+    matchLabels:
+      workload: my-agent
+
+  # Where to store memory + disk snapshots, and what to capture.
   snapshotsConfig:
     location: gs://my-bucket/snapshots/my-agent/
+    onPause: Full              # Full = process memory + rootfs delta; Data = volumes only
+    onCommit: Data             # must be a subset of onPause
+
+  # Optional durable volumes (survive across snapshots).
+  volumes:
+  - name: data
+    durableDir: {}
 ```
+
+> **runsc / sandbox binaries are no longer in the `ActorTemplate`.** The gVisor
+> `runsc` binary (and micro-VM assets) are fetched from a cluster-scoped
+> `SandboxConfig` object, selected by `sandboxClass`. The base install ships a
+> default gVisor `SandboxConfig`; you do not declare `runsc` per template.
+>
+> **The `ActorTemplate` spec is immutable.** To change the image or config,
+> create a new template (a new revision), rather than patching in place.
 
 **What happens automatically:**
 1. Controller boots a "golden" actor from your image
@@ -132,24 +152,31 @@ kubectl wait --for=condition=Ready actortemplate/my-agent -n my-app --timeout=5m
 
 ## Step 3: Create Actor Instances
 
-Actors are lightweight logical instances. You can create millions of them — they don't consume compute until activated.
+Actors are lightweight logical instances. You can create millions of them — they don't consume compute until activated. Every actor lives in an **atespace**, which must exist first.
+
+### Create the atespace (once per isolation boundary):
+```bash
+kubectl ate create atespace my-space
+```
 
 ### Via CLI:
 ```bash
-kubectl ate create actor my-session-1 --template my-app/my-agent
-kubectl ate create actor my-session-2 --template my-app/my-agent
-kubectl ate create actor user-abc-workspace --template my-app/my-agent
+# -a/--atespace is required and the atespace must already exist
+kubectl ate create actor my-session-1 --template my-app/my-agent -a my-space
+kubectl ate create actor my-session-2 --template my-app/my-agent -a my-space
+kubectl ate create actor user-abc-workspace --template my-app/my-agent -a my-space
 ```
 
 ### Via gRPC API (programmatic):
 ```protobuf
 // Service: ateapi.Control
+rpc CreateAtespace(CreateAtespaceRequest) returns (CreateAtespaceResponse);
 rpc CreateActor(CreateActorRequest) returns (CreateActorResponse);
 ```
 
 ```go
 resp, err := client.CreateActor(ctx, &ateapipb.CreateActorRequest{
-    ActorId:                "my-session-1",        // DNS-1123 label (a-z, 0-9, -)
+    ActorRef:               &ateapipb.ActorRef{Atespace: "my-space", Name: "my-session-1"},
     ActorTemplateNamespace: "my-app",
     ActorTemplateName:      "my-agent",
 })
@@ -160,7 +187,9 @@ resp, err := client.CreateActor(ctx, &ateapipb.CreateActorRequest{
 - 1–63 characters
 - Lowercase alphanumeric + hyphens only
 - Must start and end with alphanumeric
-- Must be globally unique within the cluster
+- Must be unique **within its atespace** (the `(atespace, actor-id)` pair is the identity)
+
+**Atespace rules:** an atespace name is a DNS-1123 label (same rules as an actor id). Creating an actor in a non-existent atespace fails with `FailedPrecondition`. Deleting an atespace only succeeds when it is empty.
 
 **After creation:** The actor exists in the state store as `STATUS_SUSPENDED`. Zero compute consumed.
 
@@ -173,8 +202,10 @@ This is the magic. You just send an HTTP request with a special `Host` header, a
 ### The Contract:
 
 ```
-Host: <actor-id>.actors.resources.substrate.ate.dev
+Host: <actor-id>.<atespace>.actors.resources.substrate.ate.dev
 ```
+
+The atespace is part of the name because an actor id is only unique within its atespace.
 
 ### Example:
 
@@ -184,7 +215,7 @@ kubectl port-forward -n ate-system svc/atenet-router 8000:80
 
 # Send request — actor auto-resumes from snapshot
 curl -X POST \
-  -H "Host: my-session-1.actors.resources.substrate.ate.dev" \
+  -H "Host: my-session-1.my-space.actors.resources.substrate.ate.dev" \
   -d '{"message": "hello"}' \
   http://localhost:8000/
 ```
@@ -194,8 +225,8 @@ curl -X POST \
 ```
 1. DNS resolves *.actors.resources.substrate.ate.dev → atenet-router Service IP
 2. Envoy receives the request
-3. ExtProc extracts "my-session-1" from the Host header
-4. Router calls ateapi.ResumeActor("my-session-1")
+3. ExtProc extracts "my-space" (atespace) and "my-session-1" (actor id) from the Host header
+4. Router calls ateapi.ResumeActor({atespace: "my-space", name: "my-session-1"})
 5. ateapi picks a free worker pod, downloads snapshot, restores process
 6. Actor is now RUNNING with its original memory + disk state
 7. Request is forwarded to the actor's port 80
@@ -210,7 +241,7 @@ curl -X POST \
 ### HTTPS variant:
 ```bash
 curl -X POST \
-  -H "Host: my-session-1.actors.resources.substrate.ate.dev" \
+  -H "Host: my-session-1.my-space.actors.resources.substrate.ate.dev" \
   https://localhost:8443/   # port 8443 for TLS
 ```
 
@@ -218,15 +249,23 @@ curl -X POST \
 
 ## Step 5 (Optional): Lifecycle Management
 
+All actor lifecycle commands require `-a/--atespace` because an actor is addressed by `(atespace, id)`.
+
 ### Explicit Suspend
 ```bash
-kubectl ate suspend actor my-session-1
+kubectl ate suspend actor my-session-1 -a my-space
 ```
-Checkpoints memory + disk → uploads to GCS → frees the worker pod.
+Checkpoints memory + disk → uploads to object storage → frees the worker pod.
+
+### Pause (keep snapshot on the node)
+```bash
+kubectl ate pause actor my-session-1 -a my-space
+```
+Unlike suspend, pause keeps the actor's snapshot **local on the node VM** (`STATUS_PAUSED`) for a faster resume onto the same node, without uploading to object storage.
 
 ### Explicit Resume (without HTTP trigger)
 ```bash
-kubectl ate resume actor my-session-1
+kubectl ate resume actor my-session-1 -a my-space
 ```
 
 ### Self-Suspension (from inside the actor)
@@ -236,26 +275,31 @@ Your actor code can call the Substrate API directly to suspend itself when idle:
 // Inside your actor process
 conn, _ := grpc.Dial("api.ate-system.svc.cluster.local:443", grpc.WithTransportCredentials(...))
 client := ateapipb.NewControlClient(conn)
-client.SuspendActor(ctx, &ateapipb.SuspendActorRequest{ActorId: "my-session-1"})
+client.SuspendActor(ctx, &ateapipb.SuspendActorRequest{
+    ActorRef: &ateapipb.ActorRef{Atespace: "my-space", Name: "my-session-1"},
+})
 // Process freezes here — next resume restores from this exact point
 ```
 
 ### Query State
 ```bash
-kubectl ate get actors              # List all
-kubectl ate get actor my-session-1  # Get specific
-kubectl ate get workers             # See worker pool status
+kubectl ate get actors -a my-space     # List actors in one atespace
+kubectl ate get actors -A              # List actors across all atespaces
+kubectl ate get actor my-session-1 -a my-space  # Get specific
+kubectl ate get atespaces              # List atespaces
+kubectl ate get workers                # See worker pool status
 ```
 
 ### Delete (must be suspended first)
 ```bash
-kubectl ate delete actor my-session-1
+kubectl ate delete actor my-session-1 -a my-space
+kubectl ate delete atespace my-space   # only when empty
 ```
 
 ### Observe
 ```bash
-kubectl ate logs my-session-1       # View current logs
-kubectl ate logs my-session-1 -f    # Stream (follows across pod migrations)
+kubectl ate logs actors my-session-1 -a my-space      # View current logs
+kubectl ate logs actors my-session-1 -a my-space -f   # Stream (follows across pod migrations)
 ```
 
 ---
@@ -267,12 +311,22 @@ The public API is defined in `pkg/proto/ateapipb/ateapi.proto`:
 ```protobuf
 service Control {
   rpc CreateActor(CreateActorRequest) returns (CreateActorResponse);
+  rpc UpdateActor(UpdateActorRequest) returns (UpdateActorResponse);
   rpc ResumeActor(ResumeActorRequest) returns (ResumeActorResponse);
   rpc SuspendActor(SuspendActorRequest) returns (SuspendActorResponse);
+  rpc PauseActor(PauseActorRequest) returns (PauseActorResponse);
   rpc DeleteActor(DeleteActorRequest) returns (DeleteActorResponse);
   rpc GetActor(GetActorRequest) returns (GetActorResponse);
   rpc ListActors(ListActorsRequest) returns (ListActorsResponse);
   rpc ListWorkers(ListWorkersRequest) returns (ListWorkersResponse);
+
+  // Atespaces (the isolation boundary actors live in)
+  rpc CreateAtespace(CreateAtespaceRequest) returns (CreateAtespaceResponse);
+  rpc GetAtespace(GetAtespaceRequest) returns (GetAtespaceResponse);
+  rpc ListAtespaces(ListAtespacesRequest) returns (ListAtespacesResponse);
+  rpc DeleteAtespace(DeleteAtespaceRequest) returns (DeleteAtespaceResponse);
+
+  rpc DebugClear(DebugClearRequest) returns (DebugClearResponse); // wipe DB (testing)
 }
 
 service SessionIdentity {
@@ -281,14 +335,18 @@ service SessionIdentity {
 }
 ```
 
+All actor-scoped RPCs (`Get/Create/Update/Suspend/Pause/Resume/Delete`) identify the actor with an `ActorRef { atespace, name }`.
+
 ### Actor States (from caller's perspective):
 
 | Status | Meaning | Can receive traffic? |
 |--------|---------|---------------------|
-| `SUSPENDED` | Idle, state in GCS, no compute | No (auto-resumes on request) |
+| `SUSPENDED` | Idle, snapshot in object storage, no compute | No (auto-resumes on request) |
 | `RESUMING` | Being restored onto a worker | No (request is held/queued) |
 | `RUNNING` | Active on a worker pod | **Yes** |
-| `SUSPENDING` | Being checkpointed | Depends on timing |
+| `SUSPENDING` | Being checkpointed to object storage | Depends on timing |
+| `PAUSED` | Idle, snapshot kept **local on the node VM** | No (resumes from the local snapshot) |
+| `PAUSING` | Being checkpointed to a local (node-VM) snapshot | Depends on timing |
 
 ---
 
@@ -298,7 +356,7 @@ service SessionIdentity {
 ```
 Method: Any (GET, POST, PUT, DELETE, etc.)
 URL: http(s)://<router-endpoint>/<any-path>
-Host: <actor-id>.actors.resources.substrate.ate.dev
+Host: <actor-id>.<atespace>.actors.resources.substrate.ate.dev
 Body: Anything your actor expects
 Headers: Anything — all forwarded to the actor
 ```
@@ -316,7 +374,7 @@ Headers: Anything — all forwarded to the actor
 
 | HTTP Status | Meaning |
 |-------------|---------|
-| 404 | Actor ID not found in registry |
+| 404 | Actor (or its atespace) not found, or the Host header is not a valid actor DNS name |
 | 503 | No free workers available |
 | 500 | Internal restore failure |
 | 504 | Resume timed out |
@@ -337,25 +395,28 @@ import (
 client, err := ateclient.NewClient(ctx, "", "", "", false)
 defer client.Close()
 
-// Create
+// Create the atespace (once), then the actor in it
+client.CreateAtespace(ctx, &ateapipb.CreateAtespaceRequest{Name: "my-space"})
 client.CreateActor(ctx, &ateapipb.CreateActorRequest{
-    ActorId: "agent-42",
+    ActorRef:               &ateapipb.ActorRef{Atespace: "my-space", Name: "agent-42"},
     ActorTemplateNamespace: "my-app",
-    ActorTemplateName: "my-agent",
+    ActorTemplateName:      "my-agent",
 })
 
+ref := &ateapipb.ActorRef{Atespace: "my-space", Name: "agent-42"}
+
 // Resume (explicit, not needed if using HTTP auto-resume)
-client.ResumeActor(ctx, &ateapipb.ResumeActorRequest{ActorId: "agent-42"})
+client.ResumeActor(ctx, &ateapipb.ResumeActorRequest{ActorRef: ref})
 
 // Suspend
-client.SuspendActor(ctx, &ateapipb.SuspendActorRequest{ActorId: "agent-42"})
+client.SuspendActor(ctx, &ateapipb.SuspendActorRequest{ActorRef: ref})
 
 // Query
-resp, _ := client.GetActor(ctx, &ateapipb.GetActorRequest{ActorId: "agent-42"})
+resp, _ := client.GetActor(ctx, &ateapipb.GetActorRequest{ActorRef: ref})
 fmt.Println(resp.Actor.Status)  // STATUS_RUNNING, STATUS_SUSPENDED, etc.
 
 // Delete
-client.DeleteActor(ctx, &ateapipb.DeleteActorRequest{ActorId: "agent-42"})
+client.DeleteActor(ctx, &ateapipb.DeleteActorRequest{ActorRef: ref})
 ```
 
 ---
@@ -433,7 +494,7 @@ That's it. No SDK. No special imports. Just a standard HTTP server. The `count` 
 │  2. kubectl ate / gRPC API → Actor lifecycle                    │
 │     "Create/suspend/delete logical actor instances"             │
 │                                                                 │
-│  3. HTTP requests   → Host: <id>.actors.resources.substrate...  │
+│  3. HTTP requests   → Host: <id>.<atespace>.actors.resources... │
 │     "Just send traffic — Substrate handles the rest"            │
 │                                                                 │
 │  Everything else (scheduling, snapshotting, restore, routing)   │

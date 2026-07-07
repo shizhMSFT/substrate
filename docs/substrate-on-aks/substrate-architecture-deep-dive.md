@@ -1,7 +1,7 @@
 # Agent Substrate — Architecture Deep Dive
 
 > Generated from source-code analysis of the repository at commit HEAD.  
-> Date: 2026-06-05
+> Date: 2026-07-07
 
 ---
 
@@ -16,83 +16,53 @@
 | Total actors (active + idle) per cluster | 1 billion |
 | Wakeup throughput | 1,000/sec |
 
-**Codebase:** ~29,500 lines of Go (excluding vendor), 183 source files, 7 binaries, 3 protobuf service definitions, 2 CRDs.
+**Codebase:** ~29,500 lines of Go (excluding vendor), 183 source files, 7 binaries, 3 protobuf service definitions, 3 CRDs (`WorkerPool`, `ActorTemplate`, `SandboxConfig`).
 
 ---
 
 ## 2. High-Level Architecture Diagram
 
-```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                              KUBERNETES CLUSTER                               │
-│                                                                              │
-│  ┌─────────────────── ate-system namespace ──────────────────────────────┐   │
-│  │                                                                       │   │
-│  │  ┌─────────────────┐       ┌──────────────────┐                      │   │
-│  │  │   ate-api-server │◄─────►│  Valkey (Redis)  │                      │   │
-│  │  │    (ateapi)      │       │  State Store     │                      │   │
-│  │  │  gRPC :443       │       └──────────────────┘                      │   │
-│  │  └──────▲───────────┘                                                 │   │
-│  │         │ gRPC                                                        │   │
-│  │         │                                                             │   │
-│  │  ┌──────┴───────────┐      ┌───────────────────┐                     │   │
-│  │  │  atecontroller   │      │  podcertcontroller │                     │   │
-│  │  │  (K8s controller)│      │  (TLS cert signer) │                     │   │
-│  │  └──────────────────┘      └───────────────────┘                     │   │
-│  │                                                                       │   │
-│  │  ┌──────────────────────────────────────┐                             │   │
-│  │  │           atenet (router)            │                             │   │
-│  │  │  ┌─────────┐  ┌──────────┐  ┌─────┐ │                             │   │
-│  │  │  │  Envoy  │  │ ExtProc  │  │ xDS │ │                             │   │
-│  │  │  │ Proxy   │◄─┤ Server   │  │ Srv │ │                             │   │
-│  │  │  └────▲────┘  └──────────┘  └─────┘ │                             │   │
-│  │  └───────┼──────────────────────────────┘                             │   │
-│  │          │                                                            │   │
-│  │  ┌───────┴──────────────────┐                                         │   │
-│  │  │    atenet (dns)          │                                         │   │
-│  │  │  CoreDNS orchestrator    │                                         │   │
-│  │  └──────────────────────────┘                                         │   │
-│  └───────────────────────────────────────────────────────────────────────┘   │
-│                                                                              │
-│  ┌─────── Per-Node (DaemonSet) ──────────────────────────────────────────┐   │
-│  │                                                                       │   │
-│  │  ┌─────────────┐                                                     │   │
-│  │  │   atelet    │─── gRPC (unix socket) ──┐                           │   │
-│  │  │  (herder)   │                         │                           │   │
-│  │  └─────────────┘                         ▼                           │   │
-│  │                              ┌──────────────────────┐                 │   │
-│  │                              │   Worker Pod 1       │                 │   │
-│  │                              │  ┌────────────────┐  │                 │   │
-│  │                              │  │  ateom-gvisor  │  │                 │   │
-│  │                              │  │  (runsc mgr)   │  │                 │   │
-│  │                              │  └───────┬────────┘  │                 │   │
-│  │                              │          │ runsc     │                 │   │
-│  │                              │          ▼           │                 │   │
-│  │                              │  ┌────────────────┐  │                 │   │
-│  │                              │  │  gVisor Sand-  │  │                 │   │
-│  │                              │  │  box (Actor)   │  │                 │   │
-│  │                              │  └────────────────┘  │                 │   │
-│  │                              └──────────────────────┘                 │   │
-│  │                              ┌──────────────────────┐                 │   │
-│  │                              │   Worker Pod 2 ...   │                 │   │
-│  │                              └──────────────────────┘                 │   │
-│  └───────────────────────────────────────────────────────────────────────┘   │
-│                                                                              │
-│  ┌─────── External Storage ──────────────────────────────────────────────┐   │
-│  │                                                                       │   │
-│  │  ┌────────────────────────┐                                           │   │
-│  │  │  GCS / S3 Bucket       │  (actor memory + disk snapshots, zstd)   │   │
-│  │  └────────────────────────┘                                           │   │
-│  └───────────────────────────────────────────────────────────────────────┘   │
-└──────────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    user["End User / Framework<br/>(ADK / LangChain / etc.)"]
 
-External:
-  ┌──────────────┐     HTTP/gRPC      ┌──────────────────┐
-  │  End User /  │ ──────────────────► │  Envoy Router    │
-  │  Framework   │  Host: <actor-id>   │  (atenet)        │
-  │  (ADK/Lang-  │  .actors.resources  └──────────────────┘
-  │   Chain/etc) │  .substrate.ate.dev
-  └──────────────┘
+    subgraph cluster["Kubernetes Cluster"]
+        subgraph atesys["ate-system namespace"]
+            api["ate-api-server (ateapi)<br/>gRPC :443"]
+            valkey[("Valkey / Redis<br/>state store")]
+            ctrl["atecontroller<br/>(K8s controller)"]
+            podcert["podcertcontroller<br/>(TLS cert signer)"]
+            subgraph router["atenet (router)"]
+                direction LR
+                envoy["Envoy proxy"]
+                extproc["ExtProc server"]
+                xds["xDS server"]
+            end
+            dns["atenet (dns)<br/>CoreDNS orchestrator"]
+        end
+
+        subgraph node["Per-node (DaemonSet)"]
+            atelet["atelet<br/>(herder)"]
+            subgraph pod["Worker Pod"]
+                ateom["ateom-gvisor<br/>(runsc manager)"]
+                sandbox["gVisor sandbox<br/>(Actor)"]
+            end
+        end
+    end
+
+    storage[("GCS / S3 bucket<br/>actor memory + disk snapshots (zstd)")]
+
+    user -- "HTTP/gRPC — Host: &lt;actor-id&gt;.&lt;atespace&gt;.actors.resources.substrate.ate.dev" --> envoy
+    api <-- "gRPC" --> valkey
+    ctrl -- "gRPC" --> api
+    xds -- "xDS config" --> envoy
+    extproc -- "ext_proc" --> envoy
+    extproc -- "ResumeActor (gRPC)" --> api
+    envoy -- "routes to worker IP:80" --> sandbox
+    api -- "Restore / Checkpoint (gRPC)" --> atelet
+    atelet -- "gRPC (unix socket)" --> ateom
+    ateom -- "runsc" --> sandbox
+    atelet -- "snapshots" --> storage
 ```
 
 ---
@@ -109,8 +79,9 @@ External:
 | State Store | Redis/Valkey cluster (TLS + IAM auth) |
 
 **Responsibilities:**
-- Actor lifecycle management (Create, Resume, Suspend, Delete, Get, List)
-- Worker registry and assignment scheduling
+- Actor lifecycle management (Create, Resume, Suspend, Pause, Delete, Update, Get, List)
+- Atespace management (Create, Get, List, Delete) — the isolation boundary actors live in
+- Worker registry and selector-based assignment scheduling
 - Workflow orchestration with distributed locking
 - Session identity credential issuance (JWT, mTLS certs)
 
@@ -219,15 +190,16 @@ The router is the **traffic entry point** for all actor-destined requests.
 3. **ExtProc Server** (gRPC :50051) — Envoy's External Processing filter calls this for every request
 
 **Request flow:**
-```
-Client → Envoy (port 8080) → ExtProc Server
-  → Parse Host header: "<actor-id>.actors.resources.substrate.ate.dev"
-  → Extract actor ID
-  → ActorResumer.ResumeActor(actorID) → ateapi gRPC
-      (with singleflight dedup + exponential backoff)
-  → Get worker IP
-  → Rewrite :authority header to <worker-ip>:80
-  → Envoy routes to the worker pod
+```mermaid
+flowchart TB
+    client["Client"] --> envoy["Envoy (:8080)"]
+    envoy --> extproc["ExtProc server"]
+    extproc --> parse["Parse Host header:<br/>&lt;actor-id&gt;.&lt;atespace&gt;.actors.resources.substrate.ate.dev"]
+    parse --> extract["Extract (atespace, actor ID)"]
+    extract --> resume["ActorResumer.ResumeActor(atespace, actorID) → ateapi gRPC<br/>(singleflight dedup + exponential backoff)"]
+    resume --> ip["Get worker IP"]
+    ip --> rewrite["Rewrite :authority header → &lt;worker-ip&gt;:80"]
+    rewrite --> route["Envoy routes to the worker pod"]
 ```
 
 **Key features:**
@@ -250,10 +222,12 @@ Client → Envoy (port 8080) → ExtProc Server
 | Functions | create/get/delete actors, suspend/resume, logs, admin utilities |
 
 Notable capabilities:
-- `kubectl ate logs <actor-id> [-f]` — follows logs even across pod migrations
-- `kubectl ate get actors` / `kubectl ate get workers` — query state
-- `kubectl ate suspend actor` / `kubectl ate resume actor` — lifecycle control
-- `kubectl ate admin debug-redis-flush` — wipe Redis for testing
+- `kubectl ate create atespace <name>` / `get atespaces` / `delete atespace <name>` — manage isolation boundaries (an atespace must exist before creating actors in it)
+- `kubectl ate create actor <id> --template <ns>/<name> -a <atespace>` — create an actor (`-a/--atespace` required)
+- `kubectl ate suspend|resume|pause|delete actor <id> -a <atespace>` — lifecycle control
+- `kubectl ate get actors -a <atespace>` (one atespace) or `-A` (all atespaces); `get workers` — query state
+- `kubectl ate logs actors <actor-id> -a <atespace> [-f]` — follows logs even across pod migrations
+- `kubectl ate admin debug-flush-redis` — wipe Redis for testing
 - `--trace` flag for OpenTelemetry trace propagation
 
 ---
@@ -274,11 +248,14 @@ Notable capabilities:
 # WorkerPool — defines physical compute capacity
 apiVersion: ate.dev/v1alpha1
 kind: WorkerPool
+metadata:
+  labels: {workload: agent} # pools are selected by ActorTemplate.workerSelector
 spec:
   replicas: 10              # Number of warm worker pods
   ateomImage: <image>       # ateom-gvisor container image
+  sandboxClass: gvisor      # gvisor (default) or microvm
 
-# ActorTemplate — immutable workload blueprint
+# ActorTemplate — immutable workload blueprint (spec is immutable)
 apiVersion: ate.dev/v1alpha1
 kind: ActorTemplate
 spec:
@@ -287,34 +264,47 @@ spec:
   - name: agent
     image: <image@sha256:...>
     command: ["/app/server"]
-    ports: [{containerPort: 80}]
-  workerPoolRef: {name, namespace}
+    readyz: {httpGet: {path: /readyz, port: 80}}
+    volumeMounts: [{name: data, mountPath: /home/agent}]
+  sandboxClass: gvisor      # gvisor (default) or microvm; must match eligible pools
+  workerSelector:           # label selector over WorkerPools (replaces workerPoolRef)
+    matchLabels: {workload: agent}
   snapshotsConfig:
     location: gs://bucket/path/
-  runsc:                    # gVisor binary config per arch
-    amd64: {url, sha256Hash}
-    arm64: {url, sha256Hash}
+    onPause: Full           # Full = memory + rootfs delta; Data = durable volumes only
+    onCommit: Data          # must be a subset of onPause
+  volumes:                  # optional durable volumes
+  - name: data
+    durableDir: {}
 status:
   phase: Ready
+  goldenActorID: <uuid>
   goldenSnapshot: gs://...  # Version 0 snapshot
 ```
+
+> The gVisor `runsc` binary (and micro-VM assets) are no longer declared on the
+> `ActorTemplate`. They live on a **cluster-scoped `SandboxConfig`** selected by
+> `sandboxClass`; the base install ships a default gVisor `SandboxConfig`.
 
 ### 4.2 Redis State (Dynamic Runtime State)
 
 ```
-actor:<actor-id>  →  Actor proto (JSON)
-  - actor_id, version (optimistic concurrency)
+actor:<atespace>:<actor-id>  →  Actor proto (JSON)
+  - actor_id, atespace, version (optimistic concurrency)
   - actor_template_namespace, actor_template_name
-  - status: SUSPENDED | RESUMING | RUNNING | SUSPENDING
+  - status: SUSPENDED | RESUMING | RUNNING | SUSPENDING | PAUSING | PAUSED
   - ateom_pod_namespace, ateom_pod_name, ateom_pod_ip, ateom_pod_uid
-  - last_snapshot (GCS URI), in_progress_snapshot
+  - worker_pool_name, worker_selector
+  - latest_snapshot_info (local or external), in_progress_snapshot
 
 worker:<ns>:<pool>:<pod>  →  Worker proto (JSON)
   - worker_namespace, worker_pool, worker_pod, worker_pod_uid
-  - ip, version
-  - actor_namespace, actor_template, actor_id (empty = idle)
+  - ip, node_name, version
+  - assignment: {actor_template, actor:{atespace, name}} (empty = idle)
 
-lock:actor:<actor-id>  →  UUID (TTL-based distributed lock)
+atespace:<name>  →  Atespace proto (JSON)
+
+lock:actor:<atespace>:<actor-id>  →  UUID (TTL-based distributed lock)
 ```
 
 ### 4.3 Object Storage (Snapshots)
@@ -330,55 +320,46 @@ gs://bucket/snapshots/<template>/<actor-id>/<timestamp>-<random>/
 
 ## 5. Actor State Machine
 
+```mermaid
+stateDiagram-v2
+    [*] --> SUSPENDED: CreateActor
+    SUSPENDED --> RESUMING: ResumeActor
+    RESUMING --> RUNNING: restore complete
+    RUNNING --> SUSPENDING: SuspendActor
+    SUSPENDING --> SUSPENDED: checkpoint + upload (EXTERNAL)
+    RUNNING --> PAUSING: PauseActor
+    PAUSING --> PAUSED: checkpoint on node VM (LOCAL)
+    PAUSED --> RESUMING: ResumeActor
+    SUSPENDED --> [*]: DeleteActor (GC snapshots)
 ```
-                  CreateActor
-                      │
-                      ▼
-              ┌───────────────┐
-              │   SUSPENDED   │◄──────────────────────────────────┐
-              └───────┬───────┘                                    │
-                      │ ResumeActor                                │
-                      ▼                                            │
-              ┌───────────────┐                                    │
-              │   RESUMING    │                                    │
-              └───────┬───────┘                                    │
-                      │ (restore complete)                         │
-                      ▼                                            │
-              ┌───────────────┐                                    │
-              │   RUNNING     │                                    │
-              └───────┬───────┘                                    │
-                      │ SuspendActor                               │
-                      ▼                                            │
-              ┌───────────────┐                                    │
-              │  SUSPENDING   │────── (checkpoint + upload) ───────┘
-              └───────────────┘
 
-  SUSPENDED → DeleteActor → (garbage collect snapshots)
-```
+> In addition to suspend/resume, an actor can be **paused**
+> (`RUNNING → PAUSING → PAUSED`). Pause keeps the snapshot **local on the node
+> VM** (`SnapshotInfo` of type `LOCAL`) instead of uploading it to object
+> storage, trading portability for a faster same-node resume. Suspend produces
+> an `EXTERNAL` snapshot in object storage. Both `PAUSED` and `SUSPENDED` actors
+> resume on the next request.
 
 ---
 
 ## 6. Communication Topology (gRPC Services)
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                           gRPC Services                              │
-├───────────────────┬─────────────────────────────────────────────────┤
-│  Service          │  Proto Package  │  Exposed By  │  Called By     │
-├───────────────────┼─────────────────┼──────────────┼────────────────┤
-│ ateapi.Control    │ pkg/proto/      │ ateapi       │ kubectl-ate,   │
-│                   │ ateapipb        │              │ atenet router, │
-│                   │                 │              │ atecontroller  │
-├───────────────────┼─────────────────┼──────────────┼────────────────┤
-│ ateapi.Session-   │ pkg/proto/      │ ateapi       │ actor workloads│
-│ Identity          │ ateapipb        │              │ (inside pods)  │
-├───────────────────┼─────────────────┼──────────────┼────────────────┤
-│ atelet.AteomHerder│ internal/proto/ │ atelet       │ ateapi         │
-│                   │ ateletpb        │ (per-node)   │                │
-├───────────────────┼─────────────────┼──────────────┼────────────────┤
-│ ateom.Ateom       │ internal/proto/ │ ateom-gvisor │ atelet         │
-│                   │ ateompb         │ (per-pod)    │ (unix socket)  │
-└───────────────────┴─────────────────┴──────────────┴────────────────┘
+```mermaid
+flowchart LR
+    kubectl["kubectl-ate"]
+    router["atenet router"]
+    ctrl["atecontroller"]
+    workloads["actor workloads<br/>(inside pods)"]
+    ateapi["ateapi"]
+    atelet["atelet<br/>(per-node)"]
+    ateom["ateom-gvisor<br/>(per-pod)"]
+
+    kubectl -- "ateapi.Control<br/>(pkg/proto/ateapipb)" --> ateapi
+    router -- "ateapi.Control" --> ateapi
+    ctrl -- "ateapi.Control" --> ateapi
+    workloads -- "ateapi.SessionIdentity<br/>(pkg/proto/ateapipb)" --> ateapi
+    ateapi -- "atelet.AteomHerder<br/>(internal/proto/ateletpb)" --> atelet
+    atelet -- "ateom.Ateom<br/>(internal/proto/ateompb, unix socket)" --> ateom
 ```
 
 ---
@@ -387,29 +368,37 @@ gs://bucket/snapshots/<template>/<actor-id>/<timestamp>-<random>/
 
 Here's what happens when an HTTP request arrives for a **suspended** actor:
 
-```
-1. DNS resolves "my-actor.actors.resources.substrate.ate.dev" → atenet router IP
-2. Client sends HTTP request with Host header to router (Envoy :8080)
-3. Envoy's ext_proc filter sends request headers to ExtProc server
-4. ExtProc parses actor ID from Host header
-5. ExtProc calls ActorResumer.ResumeActor(actorID)
-   └─ singleflight ensures only one in-flight resume per actor
-6. ActorResumer calls ateapi.ResumeActor(actorID) via gRPC
-7. ateapi acquires Redis lock "lock:actor:<id>"
-8. ateapi loads actor from Redis → STATUS_SUSPENDED
-9. ateapi picks a free worker from Redis (randomized)
-10. ateapi marks worker busy + actor RESUMING in Redis
-11. ateapi calls atelet.Restore() on the node hosting the worker pod
-12. atelet downloads checkpoint files from GCS (parallel, zstd decompress)
-13. atelet prepares OCI bundles (pulls images if not cached)
-14. atelet calls ateom.RestoreWorkload() via Unix socket
-15. ateom moves eth0 into interior netns
-16. ateom runs `runsc create` + `runsc restore` for pause + app containers
-17. Actor process resumes from exact memory state
-18. ateapi marks actor STATUS_RUNNING, returns worker IP
-19. ExtProc rewrites Host header to <worker-ip>:80
-20. Envoy routes original request to the now-running actor
-21. Actor serves the response
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant DNS
+    participant E as Envoy port 8080
+    participant X as ExtProc
+    participant A as ateapi
+    participant R as Redis/Valkey
+    participant L as atelet
+    participant O as ateom-gvisor
+    participant Act as Actor (gVisor)
+
+    C->>DNS: resolve my-actor.my-space.actors.resources.substrate.ate.dev
+    DNS-->>C: atenet router IP
+    C->>E: HTTP request (Host header)
+    E->>X: ext_proc request headers
+    X->>X: parse (atespace, actor ID)
+    X->>A: ResumeActor(ActorRef atespace/actorID) [singleflight]
+    A->>R: acquire lock actor:atespace:id, load actor (SUSPENDED)
+    A->>R: pick free worker, mark RESUMING
+    A->>L: Restore() on the worker's node
+    L->>L: download checkpoint (zstd), prepare OCI bundle
+    L->>O: RestoreWorkload() (unix socket)
+    O->>O: move eth0 into interior netns
+    O->>Act: runsc create + runsc restore
+    Act-->>O: resumed from exact memory state
+    A->>R: mark STATUS_RUNNING
+    A-->>X: worker IP
+    X->>E: rewrite :authority to worker-ip:80
+    E->>Act: forward original request
+    Act-->>C: response
 ```
 
 ---
@@ -519,7 +508,7 @@ Multiple simultaneous requests for the same suspended actor are collapsed into a
 
 ### 11.6 Golden Snapshot Pattern
 Each `ActorTemplate` automatically generates a "golden snapshot" (Version 0) by:
-1. Booting a fresh actor from OCI image
+1. Booting a fresh actor from OCI image (the golden actor lives in the reserved `ate-golden` atespace)
 2. Waiting 20s for initialization
 3. Suspending to create the baseline snapshot
 
@@ -539,21 +528,23 @@ All future actors instantiated from that template restore from this golden snaps
 
 ## 13. Deployment Topology
 
-```
-Per Cluster:
-  1x ate-api-server (Deployment, 1+ replicas)
-  1x atecontroller (Deployment, 1 replica)
-  1x atenet-router (Deployment, with Envoy sidecar)
-  1x atenet-dns (manages CoreDNS)
-  1x podcertcontroller (Deployment)
-  1x Valkey cluster (StatefulSet or managed Redis)
-  Nx atelet (DaemonSet, one per node)
+```mermaid
+flowchart TB
+    subgraph per_cluster["Per cluster"]
+        api["ate-api-server<br/>(Deployment, 1+ replicas)"]
+        ctrl["atecontroller<br/>(Deployment, 1)"]
+        router["atenet-router<br/>(Deployment, with Envoy)"]
+        dns["atenet-dns<br/>(manages CoreDNS)"]
+        podcert["podcertcontroller<br/>(Deployment)"]
+        valkey["Valkey cluster<br/>(StatefulSet / managed Redis)"]
+        atelet["atelet<br/>(DaemonSet, one per node)"]
+    end
 
-Per WorkerPool:
-  Mx Worker Pods (Deployment, each running ateom-gvisor)
+    subgraph per_pool["Per WorkerPool"]
+        workers["M x Worker Pods<br/>(Deployment, each running ateom-gvisor)"]
+    end
 
-External:
-  GCS/S3 bucket for snapshots
+    storage[("GCS / S3 bucket<br/>for snapshots")]
 ```
 
 ---
@@ -562,7 +553,7 @@ External:
 
 | Area | Current State | Planned |
 |------|--------------|---------|
-| Sandbox | gVisor only | + microVMs (Kata) |
+| Sandbox | gVisor + experimental micro-VM (Kata / cloud-hypervisor), selected per pool/template via `sandboxClass` | Broader micro-VM hardening |
 | Storage | GCS + S3 | + tiering (local SSD, zswap, peer-to-peer) |
 | Autoscaling | Manual replicas | Worker HPA, vertical scaling |
 | Auth | Limited (TLS, IAM) | User authz, actor-to-actor policy |
@@ -586,12 +577,13 @@ hack/install-ate-kind.sh --deploy-demo-counter
 # 3. Build CLI
 go install ./cmd/kubectl-ate
 
-# 4. Create an actor
-kubectl ate create actor my-counter-1 --template ate-demo-counter/counter
+# 4. Create an atespace, then an actor in it
+kubectl ate create atespace demo
+kubectl ate create actor my-counter-1 --template ate-demo-counter/counter -a demo
 
 # 5. Port-forward the router
 kubectl port-forward -n ate-system svc/atenet-router 8000:80
 
 # 6. Send traffic (triggers resume)
-curl -X POST -H "Host: my-counter-1.actors.resources.substrate.ate.dev" http://localhost:8000/
+curl -X POST -H "Host: my-counter-1.demo.actors.resources.substrate.ate.dev" http://localhost:8000/
 ```
