@@ -157,13 +157,13 @@ _[Bayesian rule 2: strongest counter]_ The cleanest architecture is still native
 | --- | --- | --- | --- |
 | `ClusterTrustBundle` object | KEP-3257 | Alpha v1.27; beta v1.33; upstream stable target v1.37. | Closer to GA. |
 | `clusterTrustBundle` projection | KEP-3257 | Alpha v1.29; beta v1.33; upstream stable target v1.37. | Closer to GA. |
-| `PodCertificateRequest` / `podCertificate` projection | KEP-4317 | Alpha v1.34; beta v1.35; active beta work in v1.36; no stable milestone recorded in KEP YAML. | The real timeline blocker. |
+| `PodCertificateRequest` / `podCertificate` projection | KEP-4317 | Alpha v1.34; beta v1.35; upstream stable target v1.37. | Closer to GA (was previously behind `ClusterTrustBundle`). |
 
-_[verified]_ KEP-3257 metadata says `stage: stable`, `latest-milestone: v1.37`, and `stable: 1.37`. KEP-4317 metadata says `stage: beta`, `latest-milestone: v1.36`, `alpha: v1.34`, `beta: v1.35`, and an empty stable milestone.
+_[verified]_ KEP-3257 metadata says `stage: stable`, `latest-milestone: v1.37`, and `stable: 1.37`. KEP-4317 metadata now also says `stage: stable`, `latest-milestone: v1.37`, `alpha: v1.34`, `beta: v1.35`, and `stable: v1.37`. Both APIs therefore target GA in the same upstream release (v1.37); an earlier revision of this doc incorrectly recorded KEP-4317 as beta with no stable milestone.
 
 ### AKS implication
 
-Even if `ClusterTrustBundle` lands stable upstream in v1.37, the full Substrate-native path still depends on `PodCertificateRequest`. Because `PodCertificateRequest` has no recorded stable milestone yet, do not plan near-term AKS production on native support unless AKS explicitly exposes it. _[inferred]_
+Both `ClusterTrustBundle` and `PodCertificateRequest` now target upstream stable in v1.37, so the native Substrate path is no longer blocked by an open-ended `PodCertificateRequest` timeline. The remaining gate is purely **AKS availability**: a managed AKS release must actually ship these APIs (and enable the required feature gates / API versions) before the base manifests can drop the static-Secret workaround. Do not assume availability from the upstream milestone alone — confirm against AKS release notes and live API discovery. _[inferred]_
 
 Live API discovery should win over timeline speculation:
 
