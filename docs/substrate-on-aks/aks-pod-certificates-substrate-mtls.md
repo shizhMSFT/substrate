@@ -1,6 +1,6 @@
 # AKS pod certificates and Substrate mTLS
 
-> Date: 2026-06-11
+> Date: 2026-07-07
 
 ## 1. General Kubernetes use case
 

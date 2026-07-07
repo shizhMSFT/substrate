@@ -1,6 +1,6 @@
 # Substrate Image Updates and Snapshot Semantics
 
-> Date: 2026-06-11
+> Date: 2026-07-07
 
 ## Question
 
@@ -17,7 +17,7 @@ A process/rootfs snapshot should be treated as bound to the compatibility set th
 - **`ResumeActor` reloads the latest `ActorTemplate`.** The resume workflow fetches the actor, then fetches the current `ActorTemplate` by name.
 - **Restore rebuilds OCI bundles from the current workload spec.** `atelet.Restore` downloads checkpoint files, calls `prepareOCIBundles`, then asks `ateom-gvisor` to run `runsc create` and `runsc restore`.
 - **The CRD comments already encode the invariant.** Both `PauseImage` and `Container.Image` require pinned references and say: "All images must be pinned (changing the image invalidates snapshots)."
-- **The current implementation can form an unsafe pair.** If a suspended actor has an old snapshot and the template image is changed, the current path appears to restore old checkpoint state against the latest template's image/rootfs. That may fail, or worse, appear to work until a subtle filesystem/runtime assumption breaks.
+- **The `ActorTemplate` spec is now immutable.** The CRD validates `spec` with `self == oldSelf`, so an in-place `kubectl patch` that changes the image (or any other spec field) is rejected by the API server. This closes the most obvious way to create an old-checkpoint/new-rootfs mismatch. The remaining risk is deleting and recreating a template under the same name with a new image while snapshots created under the old image still exist at a reused snapshot location.
 
 ## GitHub Findings
 
@@ -69,7 +69,7 @@ The simplest user-facing rule is: treat `ActorTemplate` as an immutable compatib
 - Boot actors under the new template and restore/migrate that app-level state explicitly.
 - If the same actor ID must survive, the platform needs an explicit upgrade/migration API; silently changing the template behind the actor is the wrong primitive.
 
-Current Substrate makes in-place template image patches especially risky because resume reloads the latest `ActorTemplate` and rebuilds OCI bundles from that spec. So a plain `kubectl patch actortemplate ... image=...` can produce the unsafe pairing: old checkpoint plus new rootfs.
+Substrate now enforces `ActorTemplate` spec immutability at the CRD level (`spec` is validated with `self == oldSelf`), so a plain `kubectl patch actortemplate ... image=...` is rejected rather than silently producing an old-checkpoint/new-rootfs pairing. Changing the image requires creating a new template revision (a new template object). Resume still reloads the current `ActorTemplate` and rebuilds OCI bundles from it, so the residual risk is deleting and recreating a template under the same name with a different image — or reusing a snapshot location across revisions — which can still form an unsafe pair.
 
 ## Practical Policy Options
 
@@ -83,11 +83,11 @@ Current Substrate makes in-place template image patches especially risky because
 
 ## Recommended Direction
 
-- **Treat `ActorTemplate` as immutable for process/rootfs snapshots.** The repo already has issues pointing this way; enforce it or create explicit template revisions.
+- **Treat `ActorTemplate` as immutable for process/rootfs snapshots.** This is now enforced: the CRD rejects any `spec` mutation (`self == oldSelf`), so image/config changes require a new template revision rather than an in-place patch.
 - **Record snapshot metadata.** Include template revision/spec hash, workload image digests, pause image digest, runsc hash/version, ateom protocol/state-format version, relevant runtime flags, and created time.
 - **Compare on resume.** If metadata does not match the selected restore policy, fail with a clear "snapshot invalidated by image/runtime change" error.
 - **Regenerate golden snapshots on compatibility-set changes.** If a new template revision/image is desired, create a new golden actor/snapshot for that revision rather than mutating the old one in place.
-- **Separate mutable app data from process/rootfs snapshots.** The state-machine issue's memory/rootfs/homedir layering is the right direction: image upgrades should degrade from process snapshot to homedir/app-data restore unless an explicit migration exists.
+- **Separate mutable app data from process/rootfs snapshots.** The state-machine issue's memory/rootfs/homedir layering is the right direction: image upgrades should degrade from process snapshot to homedir/app-data restore unless an explicit migration exists. Substrate now provides a first building block for this: `DurableDir`-typed `volumes` on the `ActorTemplate`, plus a per-snapshot `SnapshotScope` (`snapshotsConfig.onPause` / `onCommit` = `Full` vs `Data`), where `Data` captures only durable-volume contents and excludes process memory and the rest of rootfs.
 - **Cache immutable rootfs by digest for performance.** Issue #166's extracted-rootfs cache is compatible with this model: immutable image digest is a cache key and part of restore compatibility.
 - **Be conservative with runsc/worker upgrades.** Changing runsc, ateom image, GPU driver, CPU feature set, runtime flags, or backend implementation should be modeled as a compatibility boundary until metadata says otherwise.
 

@@ -1,6 +1,8 @@
 # Agent Substrate — Consumer/Caller Interaction Guide
 
 > How to use Substrate from the outside. Covers the full lifecycle from deployment to traffic routing.
+>
+> Date: 2026-07-07
 
 ---
 
